@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "suite": "banking",
+  "classes": {
+    "untrusted_source": ["read_file", "get_most_recent_transactions"],
+    "egress": ["send_money", "schedule_transaction", "update_scheduled_transaction"]
+  },
+  "rules": {
+    "R1": {"type": "taint_then_deny", "source": "untrusted_source", "sink": "egress"}
+  },
+  "notes": "untrusted_source: measured by canary probe (tools whose output carried injected text, AgentDojo v1.2.2). egress: policy choice (tools that move money out); evaluated via false-positive rate."
+}

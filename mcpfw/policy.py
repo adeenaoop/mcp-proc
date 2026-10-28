@@ -54,6 +54,8 @@ Limits of R1, to state in the report
   goes to a different server than the untrusted reads, never changes a
   decision, and is not cross-server exfiltration detection.
 """
+import hashlib
+import json
 from dataclasses import dataclass, field
 
 CLEAN = "CLEAN"
@@ -203,3 +205,210 @@ class TaintThenDeny:
         """State for logging."""
         return {"state": self.state, "version": self.version,
                 "taints": [{"tool": t.tool, "server": t.server} for t in self.taints]}
+
+
+# =====================================================================
+# Step 2: policy files and the multi-rule Policy
+# =====================================================================
+"""
+Policy file format (JSON), version 1:
+
+    {
+      "version": 1,
+      "suite": "banking",
+      "classes": {"<class name>": ["tool", ...], ...},
+      "rules":   {"<rule id>": {"type": "taint_then_deny",
+                                "source": "<class name>", "sink": "<class name>"}, ...},
+      "notes": "optional free text"
+    }
+
+Rules are evaluated in the order they appear in the file. Every mistake in a
+file raises PolicyError: a broken policy must never silently mean "no
+protection".
+"""
+
+POLICY_VERSION = 1
+_TOP_KEYS_REQUIRED = {"version", "suite", "classes", "rules"}
+_TOP_KEYS_OPTIONAL = {"notes"}
+_RULE_TYPES = {
+    # type -> (required keys besides "type", builder)
+    "taint_then_deny": ({"source", "sink"},
+                        lambda rid, spec, classes: TaintThenDeny(rid, classes[spec["source"]],
+                                                                 classes[spec["sink"]])),
+}
+
+
+class PolicyError(ValueError):
+    """The policy file or the enabled-rule selection is invalid."""
+
+
+def _canon(x):
+    return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _reject_duplicate_keys(pairs):
+    out = {}
+    for k, v in pairs:
+        if k in out:
+            raise PolicyError(f"duplicate key {k!r} (JSON would silently keep only the last one)")
+        out[k] = v
+    return out
+
+
+def _check_keys(obj, required, optional, where):
+    if not isinstance(obj, dict):
+        raise PolicyError(f"{where}: must be a JSON object")
+    missing = required - obj.keys()
+    unknown = obj.keys() - required - optional
+    if missing:
+        raise PolicyError(f"{where}: missing {sorted(missing)}")
+    if unknown:
+        raise PolicyError(f"{where}: unknown keys {sorted(unknown)} (typo?)")
+
+
+def _validate(data):
+    """Check the whole structure. Returns classes as {name: frozenset(tools)}."""
+    _check_keys(data, _TOP_KEYS_REQUIRED, _TOP_KEYS_OPTIONAL, "policy")
+    if data["version"] != POLICY_VERSION or isinstance(data["version"], bool):
+        raise PolicyError(f"policy: unsupported version {data['version']!r} (expected {POLICY_VERSION})")
+    if not isinstance(data["suite"], str) or not data["suite"]:
+        raise PolicyError("policy: suite must be a non-empty string")
+    if "notes" in data and not isinstance(data["notes"], str):
+        raise PolicyError("policy: notes must be a string")
+
+    if not isinstance(data["classes"], dict) or not data["classes"]:
+        raise PolicyError("classes: must be a non-empty object")
+    classes = {}
+    for name, tools in data["classes"].items():
+        if not name:
+            raise PolicyError("classes: empty class name")
+        if not isinstance(tools, list) or not tools:
+            raise PolicyError(f"classes.{name}: must be a non-empty list of tool names")
+        bad = [t for t in tools if not isinstance(t, str) or not t]
+        if bad:
+            raise PolicyError(f"classes.{name}: invalid tool names {bad!r}")
+        dupes = sorted({t for t in tools if tools.count(t) > 1})
+        if dupes:
+            raise PolicyError(f"classes.{name}: duplicate tools {dupes}")
+        classes[name] = frozenset(tools)
+
+    if not isinstance(data["rules"], dict) or not data["rules"]:
+        raise PolicyError("rules: must be a non-empty object")
+    for rid, spec in data["rules"].items():
+        if not rid:
+            raise PolicyError("rules: empty rule id")
+        if not isinstance(spec, dict) or "type" not in spec:
+            raise PolicyError(f"rules.{rid}: must be an object with a 'type'")
+        if spec["type"] not in _RULE_TYPES:
+            raise PolicyError(f"rules.{rid}: unknown type {spec['type']!r}; known: {sorted(_RULE_TYPES)}")
+        required, _ = _RULE_TYPES[spec["type"]]
+        _check_keys(spec, required | {"type"}, set(), f"rules.{rid}")
+        for key in sorted(required):
+            if spec[key] not in classes:
+                raise PolicyError(f"rules.{rid}.{key}: class {spec[key]!r} is not defined in classes")
+    return classes
+
+
+@dataclass(frozen=True)
+class PolicyDecision:
+    allow: bool
+    tool: str
+    server: str | None
+    rules_fired: tuple        # ids of the rules that denied, in file order
+    reason: str               # deny text for the agent ("" when allowed)
+    decisions: tuple          # per-rule Decision objects, in file order
+    _issuer: object = field(default=None, repr=False, compare=False)
+
+    def states_before(self):
+        return {d.rule: d.state_before for d in self.decisions}
+
+    def states_after(self):
+        """States after commit if allowed; unchanged if denied."""
+        if not self.allow:
+            return self.states_before()
+        return {d.rule: d.state_after for d in self.decisions}
+
+
+class Policy:
+    """The enabled rules of one policy file, evaluated together.
+
+    decide(): asks EVERY enabled rule; denied if ANY rule denies.
+    commit(): all-or-nothing. Checks that every rule's decision is still
+              current BEFORE changing any rule, so rules never get out of sync.
+    """
+
+    def __init__(self, rules, *, suite, fingerprint, enabled, source):
+        self.rules = rules                  # {rule_id: rule}, file order
+        self.suite = suite
+        self.fingerprint = fingerprint      # sha256 of the file's canonical JSON
+        self.enabled = enabled              # tuple of enabled rule ids, file order
+        self.source = source
+
+    def decide(self, tool, server=None):
+        decisions = tuple(rule.decide(tool, server) for rule in self.rules.values())
+        denied = [d for d in decisions if not d.allow]
+        return PolicyDecision(
+            allow=not denied, tool=tool, server=server,
+            rules_fired=tuple(d.rule for d in denied),
+            reason=" ".join(d.reason for d in denied),
+            decisions=decisions, _issuer=self)
+
+    def commit(self, pdecision):
+        if not isinstance(pdecision, PolicyDecision):
+            raise TypeError("commit() takes the PolicyDecision returned by decide()")
+        if pdecision._issuer is not self:
+            raise ValueError("decision was issued by a different policy")
+        if not pdecision.allow:
+            raise ValueError(f"cannot commit denied call `{pdecision.tool}`")
+        # Check everything first ...
+        for d in pdecision.decisions:
+            rule = self.rules[d.rule]
+            if d._issuer is not rule:
+                raise ValueError(f"{d.rule}: decision was issued by a different rule")
+            if d.version != rule.version or d.state_before != rule.state:
+                raise StaleDecisionError(f"{d.rule}: decision for `{d.tool}` is stale")
+        # ... then change everything.
+        for d in pdecision.decisions:
+            self.rules[d.rule].commit(d)
+
+    def snapshot(self):
+        return {rid: rule.snapshot() for rid, rule in self.rules.items()}
+
+
+def policy_from_dict(data, enabled=None, source="<dict>"):
+    """Build a Policy from already-parsed JSON. enabled=None means all rules."""
+    classes = _validate(data)
+    all_ids = list(data["rules"])
+    if enabled is None:
+        chosen = all_ids
+    else:
+        if isinstance(enabled, str):
+            raise PolicyError("enabled must be a list of rule ids, not a single string")
+        enabled = list(enabled)
+        if not enabled:
+            raise PolicyError("no rules enabled (to run without enforcement, run mcpfw without a policy)")
+        unknown = [r for r in enabled if r not in data["rules"]]
+        if unknown:
+            raise PolicyError(f"enabled rules not in the policy: {unknown}; available: {all_ids}")
+        chosen = [r for r in all_ids if r in enabled]        # file order, deterministic
+    rules = {}
+    for rid in chosen:
+        spec = data["rules"][rid]
+        _, build = _RULE_TYPES[spec["type"]]
+        rules[rid] = build(rid, spec, classes)
+    return Policy(rules, suite=data["suite"], fingerprint=hashlib.sha256(_canon(data)).hexdigest(),
+                  enabled=tuple(chosen), source=source)
+
+
+def load_policy(path, enabled=None):
+    """Read and validate a policy file. Raises PolicyError on any problem."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f, object_pairs_hook=_reject_duplicate_keys)
+    except OSError as e:
+        raise PolicyError(f"{path}: cannot read ({e})") from None
+    except json.JSONDecodeError as e:
+        raise PolicyError(f"{path}: invalid JSON ({e})") from None
+    except PolicyError as e:
+        raise PolicyError(f"{path}: {e}") from None
+    return policy_from_dict(data, enabled, source=str(path))
