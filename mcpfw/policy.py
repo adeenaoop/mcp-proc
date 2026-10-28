@@ -374,6 +374,16 @@ class Policy:
     def snapshot(self):
         return {rid: rule.snapshot() for rid, rule in self.rules.items()}
 
+    def states(self):
+        return {rid: rule.state for rid, rule in self.rules.items()}
+
+    def named_tools(self):
+        """Every tool name the enabled rules refer to (for checking against tools/list)."""
+        names = set()
+        for rule in self.rules.values():
+            names |= rule.sources | rule.sinks
+        return names
+
 
 def policy_from_dict(data, enabled=None, source="<dict>"):
     """Build a Policy from already-parsed JSON. enabled=None means all rules."""

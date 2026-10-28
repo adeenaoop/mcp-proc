@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_replay import BAD_CALLS, PROXY, SERVER, BENCH, SUITE, numeric, run_direct, suite  # noqa: E402
+from test_replay import BAD_CALLS, MCPFW_EXTRA_ARGS, PROXY, SERVER, BENCH, SUITE, numeric, run_direct, suite  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "harness"))
 from bridge import MCPBridge  # noqa: E402
@@ -32,7 +32,7 @@ def run_through_proxy(calls, ep_dir, user_task_id=None, tee=True):
                    "--env-out", str(ep_dir / "env_post.json")]
     if user_task_id:
         server_args += ["--user-task", user_task_id]
-    proxy_args = [str(PROXY), "--log", str(ep_dir / "trace.jsonl")]
+    proxy_args = [str(PROXY), "--log", str(ep_dir / "trace.jsonl"), *MCPFW_EXTRA_ARGS]
     if tee:
         proxy_args += ["--tee", str(ep_dir / "wire")]
     bridge = MCPBridge(sys.executable, proxy_args + ["--", sys.executable, *server_args],

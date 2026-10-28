@@ -49,7 +49,9 @@ class ChainWriter:
         self._prev = GENESIS
         self.count = 0
 
-    def write(self, *, seq, t_req, t_resp, tool, args, is_error, result_text, result):
+    def write(self, *, seq, t_req, t_resp, tool, args, is_error, result_text, result, extra=None):
+        """extra: additional fields (e.g. policy decision), chained like the rest.
+        They may not overwrite a core field."""
         record = {
             "seq": seq,
             "t_req": t_req,
@@ -62,6 +64,11 @@ class ChainWriter:
             "res_h": sha256_hex(canon(result)),
             "prev": self._prev,
         }
+        if extra:
+            clash = sorted(set(extra) & (set(record) | {"h"}))
+            if clash:
+                raise ValueError(f"extra fields would overwrite core fields: {clash}")
+            record.update(extra)
         record["h"] = chain_hash(self._prev, record)
         self._f.write(canon(record) + b"\n")
         self._f.flush()

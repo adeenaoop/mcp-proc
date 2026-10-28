@@ -24,6 +24,7 @@ Run from ~/fyp:
     X1_VIA_PROXY=1 pytest tests/test_replay.py -v    # harness <-> mcpfw <-> server (after §8)
 """
 import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -42,6 +43,9 @@ BENCH, SUITE = "v1.2.2", "banking"
 SERVER = ROOT / "server" / "agentdojo_mcp_server.py"
 PROXY = ROOT / "mcpfw" / "proxy.py"
 VIA_PROXY = os.environ.get("X1_VIA_PROXY") == "1"
+# Extra mcpfw options, e.g. MCPFW_EXTRA_ARGS="--policy policies/banking.json"
+# (used to rerun X1/X2/X3 with a policy loaded in audit mode)
+MCPFW_EXTRA_ARGS = shlex.split(os.environ.get("MCPFW_EXTRA_ARGS", ""))
 
 suite = get_suite(BENCH, SUITE)
 EnvType = suite.environment_type
@@ -95,7 +99,7 @@ def mcp_command(ep_dir, user_task_id):
     if not VIA_PROXY:
         return sys.executable, server_args
     # §8.1: mcpfw --log <trace> -- <server command and args>
-    return sys.executable, [str(PROXY), "--log", str(ep_dir / "trace.jsonl"),
+    return sys.executable, [str(PROXY), "--log", str(ep_dir / "trace.jsonl"), *MCPFW_EXTRA_ARGS,
                             "--", sys.executable, *server_args]
 
 
