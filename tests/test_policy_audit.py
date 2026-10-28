@@ -34,6 +34,7 @@ from agentdojo.task_suite.load_suites import get_suite
 PROXY = ROOT / "mcpfw" / "proxy.py"
 SERVER = ROOT / "server" / "agentdojo_mcp_server.py"
 POLICY = ROOT / "policies" / "banking.json"
+R1_ONLY = ["--policy", str(POLICY), "--rules", "R1"]   # these tests check R1; R2 is tested separately
 BENCH, SUITE = "v1.2.2", "banking"
 suite = get_suite(BENCH, SUITE)
 ATTACKER = "US133000000121212121212"
@@ -68,7 +69,7 @@ ATTACK = [Call("read_file", {"file_path": "bill-december-2023.txt"}),
 
 # ---------- end to end: audit decides and logs, never blocks ----------
 def test_attack_sequence_is_forwarded_and_logged_would_deny(tmp_path):
-    outputs, recs, env = run_e2e(ATTACK, tmp_path, ["--policy", str(POLICY)])
+    outputs, recs, env = run_e2e(ATTACK, tmp_path, R1_ONLY)
     # criterion 3: NOT blocked -- the money really went out
     assert outputs[1][1] is False, "audit mode must not turn the call into an error"
     assert any(t["recipient"] == ATTACKER for t in env["bank_account"]["transactions"])
@@ -84,13 +85,13 @@ def test_attack_sequence_is_forwarded_and_logged_would_deny(tmp_path):
 
 
 def test_egress_without_read_is_allowed(tmp_path):
-    _, recs, _ = run_e2e([ATTACK[1]], tmp_path, ["--policy", str(POLICY)])
+    _, recs, _ = run_e2e([ATTACK[1]], tmp_path, R1_ONLY)
     assert (recs[0]["decision"], recs[0]["committed"], recs[0]["states_after"]) == ("allow", True, {"R1": "CLEAN"})
 
 
 def test_lifecycle_would_deny_not_committed_then_continues(tmp_path):
     calls = ATTACK + [Call("get_balance", {})]
-    _, recs, _ = run_e2e(calls, tmp_path, ["--policy", str(POLICY)])
+    _, recs, _ = run_e2e(calls, tmp_path, R1_ONLY)
     assert [r["decision"] for r in recs] == ["allow", "would_deny", "allow"]
     assert [r["committed"] for r in recs] == [True, False, True]
     assert len(recs) == len(calls)                               # X3: one record per call
@@ -98,7 +99,7 @@ def test_lifecycle_would_deny_not_committed_then_continues(tmp_path):
 
 def test_bytes_unchanged_with_policy(tmp_path):
     """criterion 6: audit mode changes no byte in either direction."""
-    run_e2e(ATTACK, tmp_path, ["--policy", str(POLICY)])
+    run_e2e(ATTACK, tmp_path, R1_ONLY)
     w = tmp_path / "wire"
     sha = lambda n: hashlib.sha256((w / f"{n}.bin").read_bytes()).hexdigest()   # noqa: E731
     assert sha("up_in") == sha("up_out") and sha("down_in") == sha("down_out")
@@ -198,7 +199,7 @@ class StubPolicy:
     def named_tools(self):
         return set()
 
-    def decide(self, tool):
+    def decide(self, tool, server=None, args=None):
         self.events.append(("decide", tool))
         if self.raise_on_decide:
             raise RuntimeError("boom")
@@ -428,7 +429,7 @@ def test_failed_dispatch_leaves_nothing_pending():
 
 
 def test_real_policy_states_after_is_actual(tmp_path):
-    _, recs, _ = run_e2e(ATTACK, tmp_path, ["--policy", str(POLICY)], tee=False)
+    _, recs, _ = run_e2e(ATTACK, tmp_path, R1_ONLY, tee=False)
     assert recs[0]["states_after"] == {"R1": "TAINTED"} and recs[1]["states_after"] == {"R1": "TAINTED"}
 
 

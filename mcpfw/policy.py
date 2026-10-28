@@ -261,6 +261,17 @@ class DistinctDestinationLimit:
     destinations: list = field(default_factory=list, init=False)   # committed, normalised, in order
     version: int = field(default=0, init=False)
 
+    uses_args = True          # Policy.decide passes the call's arguments (not a dataclass field)
+
+    @property
+    def sources(self):
+        """R2 reads no untrusted-source class (kept so Policy.named_tools() treats all rules alike)."""
+        return frozenset()
+
+    @property
+    def sinks(self):
+        return frozenset(self.dest_args)
+
     def __post_init__(self):
         if not isinstance(self.rule_id, str) or not self.rule_id:
             raise ValueError("rule_id must be a non-empty string")
@@ -358,10 +369,17 @@ Policy file format (JSON), version 1:
       "version": 1,
       "suite": "banking",
       "classes": {"<class name>": ["tool", ...], ...},
-      "rules":   {"<rule id>": {"type": "taint_then_deny",
-                                "source": "<class name>", "sink": "<class name>"}, ...},
+      "rules":   {"<rule id>": {...one of the rule types below...}, ...},
       "notes": "optional free text"
     }
+
+Rule types:
+    {"type": "taint_then_deny", "source": "<class>", "sink": "<class>"}           (R1)
+    {"type": "distinct_destination_limit", "sink": "<class>", "k": <int >= 1>,
+     "destination_arg": {"<tool>": "<argument name>", ...},                      (R2)
+     "optional": ["<tool>", ...]}          # optional key: tools that may omit it
+  For R2, destination_arg must name exactly the tools in the sink class (no
+  more, no fewer), so a typo in a tool name cannot silently leave a tool unchecked.
 
 Rules are evaluated in the order they appear in the file. Every mistake in a
 file raises PolicyError: a broken policy must never silently mean "no
@@ -371,16 +389,59 @@ protection".
 POLICY_VERSION = 1
 _TOP_KEYS_REQUIRED = {"version", "suite", "classes", "rules"}
 _TOP_KEYS_OPTIONAL = {"notes"}
-_RULE_TYPES = {
-    # type -> (required keys besides "type", builder)
-    "taint_then_deny": ({"source", "sink"},
-                        lambda rid, spec, classes: TaintThenDeny(rid, classes[spec["source"]],
-                                                                 classes[spec["sink"]])),
-}
 
 
 class PolicyError(ValueError):
     """The policy file or the enabled-rule selection is invalid."""
+
+
+def _need_class(rid, spec, key, classes):
+    if not isinstance(spec[key], str) or spec[key] not in classes:
+        raise PolicyError(f"rules.{rid}.{key}: class {spec[key]!r} is not defined in classes")
+
+
+def _check_taint_then_deny(rid, spec, classes):
+    _need_class(rid, spec, "source", classes)
+    _need_class(rid, spec, "sink", classes)
+
+
+def _check_destination_limit(rid, spec, classes):
+    _need_class(rid, spec, "sink", classes)
+    k = spec["k"]
+    if isinstance(k, bool) or not isinstance(k, int) or k < 1:
+        raise PolicyError(f"rules.{rid}.k: must be an integer >= 1, got {k!r}")
+    dest = spec["destination_arg"]
+    if not isinstance(dest, dict) or not dest:
+        raise PolicyError(f"rules.{rid}.destination_arg: must be a non-empty object tool -> argument name")
+    bad = sorted(t for t, a in dest.items() if not t or not isinstance(a, str) or not a)
+    if bad:
+        raise PolicyError(f"rules.{rid}.destination_arg: invalid entries for {bad}")
+    sink = classes[spec["sink"]]
+    missing, extra = sorted(sink - dest.keys()), sorted(dest.keys() - sink)
+    if missing or extra:
+        raise PolicyError(f"rules.{rid}.destination_arg: must name exactly the tools in class "
+                          f"{spec['sink']!r}; missing {missing}, not in the class {extra}")
+    opt = spec.get("optional", [])
+    if not isinstance(opt, list) or any(not isinstance(t, str) or not t for t in opt):
+        raise PolicyError(f"rules.{rid}.optional: must be a list of tool names")
+    dupes = sorted({t for t in opt if opt.count(t) > 1})
+    if dupes:
+        raise PolicyError(f"rules.{rid}.optional: duplicate tools {dupes}")
+    not_sink = sorted(set(opt) - sink)
+    if not_sink:
+        raise PolicyError(f"rules.{rid}.optional: tools not in class {spec['sink']!r}: {not_sink}")
+
+
+_RULE_TYPES = {
+    # type -> (required keys besides "type", optional keys, check, builder)
+    "taint_then_deny": (
+        {"source", "sink"}, set(), _check_taint_then_deny,
+        lambda rid, spec, classes: TaintThenDeny(rid, classes[spec["source"]], classes[spec["sink"]])),
+    "distinct_destination_limit": (
+        {"sink", "k", "destination_arg"}, {"optional"}, _check_destination_limit,
+        lambda rid, spec, classes: DistinctDestinationLimit(rid, spec["destination_arg"], spec["k"],
+                                                            spec.get("optional", ()))),
+}
 
 
 def _canon(x):
@@ -442,11 +503,9 @@ def _validate(data):
             raise PolicyError(f"rules.{rid}: must be an object with a 'type'")
         if spec["type"] not in _RULE_TYPES:
             raise PolicyError(f"rules.{rid}: unknown type {spec['type']!r}; known: {sorted(_RULE_TYPES)}")
-        required, _ = _RULE_TYPES[spec["type"]]
-        _check_keys(spec, required | {"type"}, set(), f"rules.{rid}")
-        for key in sorted(required):
-            if spec[key] not in classes:
-                raise PolicyError(f"rules.{rid}.{key}: class {spec[key]!r} is not defined in classes")
+        required, optional, check, _ = _RULE_TYPES[spec["type"]]
+        _check_keys(spec, required | {"type"}, optional, f"rules.{rid}")
+        check(rid, spec, classes)
     return classes
 
 
@@ -485,8 +544,12 @@ class Policy:
         self.enabled = enabled              # tuple of enabled rule ids, file order
         self.source = source
 
-    def decide(self, tool, server=None):
-        decisions = tuple(rule.decide(tool, server) for rule in self.rules.values())
+    def decide(self, tool, server=None, args=None):
+        """args: the call's `arguments` object. Rules marked uses_args (R2) need
+        it; without it they fail closed (deny). R1 ignores it."""
+        decisions = tuple(rule.decide(tool, args, server) if getattr(rule, "uses_args", False)
+                          else rule.decide(tool, server)
+                          for rule in self.rules.values())
         denied = [d for d in decisions if not d.allow]
         return PolicyDecision(
             allow=not denied, tool=tool, server=server,
@@ -545,7 +608,7 @@ def policy_from_dict(data, enabled=None, source="<dict>"):
     rules = {}
     for rid in chosen:
         spec = data["rules"][rid]
-        _, build = _RULE_TYPES[spec["type"]]
+        build = _RULE_TYPES[spec["type"]][3]
         rules[rid] = build(rid, spec, classes)
     return Policy(rules, suite=data["suite"], fingerprint=hashlib.sha256(_canon(data)).hexdigest(),
                   enabled=tuple(chosen), source=source)

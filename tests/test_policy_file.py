@@ -45,7 +45,7 @@ def step(p, tool, server=None):
 # ---------- the real banking file ----------
 def test_banking_file_loads():
     p = load_policy(BANKING)
-    assert isinstance(p, Policy) and p.suite == "banking" and p.enabled == ("R1",)
+    assert isinstance(p, Policy) and p.suite == "banking" and p.enabled == ("R1", "R2")
 
 
 def test_banking_file_tools_exist_in_agentdojo():
@@ -67,7 +67,7 @@ def test_file_policy_behaves_like_hand_built_r1():
         ["get_user_info", "update_password", "read_file", "update_scheduled_transaction"],
     ]
     for seq in sequences:
-        p = load_policy(BANKING)
+        p = load_policy(BANKING, ["R1"])                      # R1 only: compared with a hand-built R1
         h = TaintThenDeny("R1", data["classes"]["untrusted_source"], data["classes"]["egress"])
         for tool in seq:
             pd, hd = p.decide(tool), h.decide(tool)

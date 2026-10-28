@@ -17,7 +17,7 @@ from test_policy_audit import (ATTACK, ATTACKER, POLICY, Call, Events, Recording
                                StubPolicy, StubStdin, StubTee, call_line, run_e2e)
 from wire import Tee, WireMismatch, verify_tee  # noqa: E402
 
-ENFORCE = ["--policy", str(POLICY), "--mode", "enforce"]
+ENFORCE = ["--policy", str(POLICY), "--rules", "R1", "--mode", "enforce"]   # R1 tests; R2 tested separately
 
 
 def attacker_txns(env):
@@ -69,7 +69,7 @@ def test_session_continues_after_block(tmp_path):
 
 
 def test_audit_mode_unchanged_by_enforce_code(tmp_path):
-    outputs, recs, env = run_e2e(ATTACK, tmp_path, ["--policy", str(POLICY)])   # default = audit
+    outputs, recs, env = run_e2e(ATTACK, tmp_path, ["--policy", str(POLICY), "--rules", "R1"])   # default = audit
     assert outputs[1][1] is False and len(attacker_txns(env)) == 1
     assert (recs[1]["decision"], recs[1]["action"]) == ("would_deny", "forward")
 

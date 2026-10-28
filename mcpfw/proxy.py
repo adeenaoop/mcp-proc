@@ -283,9 +283,13 @@ class Proxy:
         return sum(len(q) for q in self.pending.values())
 
     # ---------------- policy (audit) ----------------
-    def check(self, tool, problem=None):
+    def check(self, tool, problem=None, args=None):
         """Ask the policy about one call. Returns (PolicyDecision or None, log fields).
         Never raises: any failure becomes decision "policy_error".
+
+        args: the call's `arguments` object exactly as split_call() returned it
+        (only used when problem is None, i.e. it is a well-formed object).
+        Rules that need it (R2) read their destination from it.
 
         decision (what the policy said):
             allow         policy allows; committed after successful dispatch
@@ -307,7 +311,7 @@ class Proxy:
                 problem = f"policy marked FAILED earlier in this session ({self.policy_failure})"
             if problem is not None:
                 raise ValueError(problem)
-            pd = self.policy.decide(tool)
+            pd = self.policy.decide(tool, args=args)
             if pd.allow:
                 decision, action = "allow", "forward"
             else:
@@ -315,6 +319,12 @@ class Proxy:
             fields.update(decision=decision, action=action,
                           rules_fired=list(pd.rules_fired), states_before=pd.states_before(),
                           states_after=pd.states_after(), reason=pd.reason)
+            # Which destination each rule counted (R2). Only present when a rule
+            # checked one, so R1-only records are exactly as before.
+            dests = {d.rule: d.destination for d in getattr(pd, "decisions", ())
+                     if getattr(d, "destination", None) is not None}
+            if dests:
+                fields["destinations"] = dests
         except Exception as e:                       # noqa: BLE001 (any failure -> policy_error)
             error = f"{type(e).__name__}: {e}"
             fields.update(decision="policy_error", action="block" if enforce else "forward",
@@ -461,7 +471,7 @@ class Proxy:
                         warn(f"{problem}; forwarded unchanged")
                 if self.policy is not None:
                     if is_call:
-                        pd, fields = self.check(tool, problem)
+                        pd, fields = self.check(tool, problem, args)
                     elif msg is not None and msg.get("method") == "tools/list" and "id" in msg:
                         self.list_ids.add(id_key(msg["id"]))
                     elif msg is not None and msg.get("method") == "tools/call":
