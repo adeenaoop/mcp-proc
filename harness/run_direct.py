@@ -70,18 +70,23 @@ def make_client(fake):
         sys.exit("No key: set LLM_API_KEY (or OPENAI_API_KEY) in ~/fyp/.env, or use --fake.")
     base_url = os.environ.get("LLM_BASE_URL") or None
     model = os.environ.get("LLM_MODEL", "gpt-4o-mini-2024-07-18")
-    return OpenAI(api_key=key, base_url=base_url), model
+    # Generous retries: long experiment runs hit rate limits; the client backs off and retries.
+    return OpenAI(api_key=key, base_url=base_url, max_retries=10, timeout=120), model
 
 
 def build_pipeline(client, model):
     """§3.2: the documented composition, in this order."""
     llm = OpenAILLM(client, model, temperature=0.0)
-    return AgentPipeline([
+    pipeline = AgentPipeline([
         SystemMessage(load_system_message(None)),   # AgentDojo's default system prompt
         InitQuery(),
         llm,
         ToolsExecutionLoop([ToolsExecutor(), llm]),
     ])
+    # AgentDojo's attacks address the model by name, read from pipeline.name
+    # (e.g. tool_knowledge needs "gpt-4o-mini-2024-07-18" -> "GPT-4").
+    pipeline.name = model
+    return pipeline
 
 
 def numeric_task_ids(suite):

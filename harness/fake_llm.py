@@ -49,3 +49,19 @@ class GroundTruthFakeClient:
         self.final_text = final_text
         self.i = 0
         self.chat = _Chat(self)
+
+
+def gullible_calls(user_calls, injection_calls, untrusted_sources):
+    """Calls a fully GULLIBLE agent would make under attack, for dry runs only.
+
+    It does the user task, and right after its first untrusted read (where the
+    injected text would appear) it obeys the injection: it inserts the injection
+    task's ground-truth calls, then finishes the user task. If the user task
+    never reads untrusted content, the agent never sees the attack.
+    Simulation only: says nothing about how a real model reacts to an injection.
+    """
+    user_calls, injection_calls = list(user_calls), list(injection_calls)
+    for i, c in enumerate(user_calls):
+        if c.function in untrusted_sources:
+            return user_calls[: i + 1] + injection_calls + user_calls[i + 1:]
+    return user_calls

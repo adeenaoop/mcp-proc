@@ -1,15 +1,29 @@
 """mcpfw: MCP stdio proxy with a hash-chained call log (guide §8).
 
-Without --policy: pure pass-through. Forwards every byte unchanged in both
-directions and logs each tools/call with its response. This is exactly the
-Week 1 code path.
+Three ways to run it:
 
-With --policy (step 3, AUDIT mode): before forwarding each tools/call, the
-policy is asked for a decision, and the decision is written into that call's
-log record. Audit mode NEVER blocks: every call is forwarded unchanged. A call
-the policy would deny is logged as "would_deny" and does NOT change policy
-state (as if it had been blocked), so the log shows what enforcement would
-decide on this exact trace. Enforcement (actually blocking) is step 4.
+  no --policy      Pass-through. Every byte is forwarded unchanged in both
+                   directions (X2 proves this) and each tools/call is logged.
+                   The log format is the Week 1 format, with one addition: two
+                   in-flight calls with the same id are both marked
+                   "duplicate_id": true. (The internal bookkeeping changed in
+                   step 3 to fix a logging race and a crash on malformed
+                   params; the bytes on the wire did not change.)
+
+  --mode audit     (default with --policy) The policy decides each tools/call
+                   BEFORE it is forwarded; the decision is logged. Nothing is
+                   blocked: a call the policy would deny is forwarded, logged
+                   as "would_deny", and NOT committed, so the log shows what
+                   enforcement would decide on this exact trace.
+
+  --mode enforce   Same decisions, but a denied call is NOT forwarded. mcpfw
+                   answers the agent itself with a tool error carrying the
+                   block reason (same JSON-RPC id), so the agent can continue.
+                   Fail closed: a call the policy cannot decide (malformed
+                   call, policy failure) is blocked too.
+
+Log fields with a policy: "decision" is what the policy said (allow,
+would_deny, deny, policy_error); "action" is what mcpfw did (forward, block).
 
 Lifecycle per tools/call:
     parse a copy -> [decide] -> register as pending -> forward ORIGINAL bytes
@@ -21,34 +35,58 @@ written only when BOTH the response has arrived AND dispatch has finished
 
 Commit criterion = successful DISPATCH: the request bytes were written and
 drain() returned. This does NOT mean the tool ran successfully; drain() only
-says the bytes left the proxy's buffer. If writing fails, the call is dropped
-from pending and never committed.
+says the bytes left the proxy's buffer. If writing fails, the call is not
+confirmed as dispatched: it is dropped from pending and never committed
+(this does not prove the server received nothing).
 
-Not covered yet (step 4/6): JSON arrays (batches) and tools/call messages
-without an id are forwarded WITHOUT a policy decision (a warning is printed).
-Audit coverage is therefore "tools/call requests with an id", not every
-possible message.
+A blocked call is never registered as pending (no server response will come);
+its record is written immediately, BEFORE the block response is sent, so no
+block ever happens without a log record.
 
-Malformed calls (params not an object, missing/invalid tool name) never crash
-the proxy: they are forwarded unchanged and logged with decision
-"policy_error" (no real decision made), never "allow". Two in-flight calls
-with the same id are both kept (FIFO per id) and both records are marked
-"duplicate_id": true; step 4 will deny duplicates.
+Not covered yet (step 5): JSON arrays (batches) and tools/call messages
+without an id are forwarded WITHOUT a policy decision (a warning is printed),
+in every mode; duplicate in-flight ids are decided and forwarded normally but
+not rejected (records marked "duplicate_id"). Coverage is therefore
+"tools/call requests with an id", not every possible message.
+
+Malformed calls never crash the proxy: params not an object, arguments not an
+object (null counts as "no arguments"), missing/invalid tool name, or a request
+id that is not a string or integer (MCP's rule). Audit: forwarded unchanged,
+logged as "policy_error". Enforce: blocked, logged as "policy_error" (an
+invalid id gets a JSON-RPC "Invalid Request" error with id null, because an
+invalid id cannot be echoed). Never "allow".
+
+Failure rules (fail closed):
+  * Policy health. If the policy machinery fails (a commit raises, or its state
+    cannot be read), the policy is marked FAILED for the rest of the session:
+    its state can no longer be trusted. Enforce: every later tools/call is
+    blocked as policy_error. Audit: logged as policy_error, forwarded. The call
+    whose commit failed is still logged as forwarded (it was already sent).
+  * Audit log. If a log record cannot be written, the session is stopped:
+    nothing more is forwarded in either direction, the server's stdin is
+    closed, and mcpfw exits with code 3. A blocked call is never forwarded and
+    never answered without its record.
+    Limit: a forwarded call's record is written when its RESPONSE arrives, so a
+    failure is detected then. Calls a client already sent before that moment
+    (pipelining) were forwarded and cannot be recalled. With a sequential client
+    (one call, wait for the reply, next call -- as AgentDojo's agent does), no
+    call is ever forwarded after a failed record.
 
 Usage:
     python mcpfw/proxy.py --log run/<ep>/trace.jsonl [--tee DIR] \
-        [--policy policies/banking.json [--rules R1,R2] [--mode audit]] \
+        [--policy policies/banking.json [--rules R1,R2] [--mode audit|enforce]] \
         -- <server command and args...>
 
 Exit codes: the server's exit code; 2 if the policy file or --rules is invalid
 (checked BEFORE the server is started, so no server ever runs unprotected by
-mistake).
+mistake); 3 if the audit log could not be written (session stopped).
 
 Standard library only. RULE: never print to stdout (it carries the protocol).
 """
 import argparse
 import asyncio
 import json
+import signal
 import sys
 import time
 
@@ -62,6 +100,12 @@ except ImportError:                     # python mcpfw/proxy.py
     from wire import LINE_LIMIT, Tee, read_line
 
 EXIT_BAD_POLICY = 2
+EXIT_LOG_FAILURE = 3
+EXIT_TERMINATED = 143                                # 128 + SIGTERM, the shell convention
+
+
+class SessionAbort(Exception):
+    """The audit log could not be written: stop the protected session."""
 
 
 def warn(*args):
@@ -70,18 +114,24 @@ def warn(*args):
 
 def parse_args(argv):
     if "--" not in argv:
-        sys.exit("usage: mcpfw --log FILE [--tee DIR] [--policy FILE [--rules R1,..] [--mode audit]] -- <server...>")
+        sys.exit("usage: mcpfw --log FILE [--tee DIR] [--policy FILE [--rules R1,..] [--mode audit|enforce]] -- <server...>")
     split = argv.index("--")
     p = argparse.ArgumentParser(prog="mcpfw")
     p.add_argument("--log", required=True, help="trace.jsonl path")
     p.add_argument("--tee", default=None, help="directory for raw byte captures (X2)")
     p.add_argument("--policy", default=None, help="policy JSON file; omit for pure pass-through")
     p.add_argument("--rules", default=None, help="comma-separated rule ids to enable (default: all in file)")
-    p.add_argument("--mode", default="audit", choices=["audit"],
-                   help="audit = decide and log, never block (enforce comes in step 4)")
+    p.add_argument("--mode", default=None, choices=["audit", "enforce"],
+                   help="audit = decide and log, never block (default); enforce = block denied calls")
+    p.add_argument("--stats", default=None,
+                   help="at exit, write peak memory (proxy and server) to this JSON file")
     args = p.parse_args(argv[:split])
     if args.rules is not None and args.policy is None:
         p.error("--rules needs --policy")
+    if args.mode is not None and args.policy is None:
+        p.error("--mode needs --policy")
+    if args.mode is None:
+        args.mode = "audit"
     args.child = argv[split + 1:]
     if not args.child:
         sys.exit("mcpfw: no server command after --")
@@ -115,6 +165,35 @@ def result_text_and_error(msg):
     return result, text, bool(result.get("isError", False))   # wire format is camelCase
 
 
+def block_response(msg_id, reason):
+    """The tool error mcpfw sends instead of forwarding a blocked call.
+    Same shape as a server's tool error, so MCPRuntime/AgentDojo handle it
+    normally; the id is echoed exactly as received (number or string)."""
+    result = {"content": [{"type": "text", "text": reason}], "isError": True}
+    line = json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": result},
+                      ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+    return result, line
+
+
+def valid_request_id(msg_id):
+    """MCP: a request id must be a string or an integer (not null, bool, float,
+    array or object)."""
+    return isinstance(msg_id, str) or (isinstance(msg_id, int) and not isinstance(msg_id, bool))
+
+
+def invalid_request_response(reason):
+    """JSON-RPC 'Invalid Request' error. id is null because an invalid id
+    cannot be echoed back (JSON-RPC 2.0, section 5)."""
+    error = {"code": -32600, "message": reason}
+    line = json.dumps({"jsonrpc": "2.0", "id": None, "error": error},
+                      ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+    return error, line
+
+
+NO_DECISION_REASON = ("Blocked by mcpfw: no policy decision could be made for this call ({error}). "
+                      "In enforce mode, calls the policy cannot decide are blocked.")
+
+
 def id_key(msg_id):
     return json.dumps(msg_id)            # keeps 1 and "1" distinct, exactly as parsed
 
@@ -123,9 +202,11 @@ def split_call(msg):
     """(tool, args, problem) from a tools/call message. Never raises.
 
     problem is None for a well-formed call, otherwise a short description
-    (malformed params, invalid tool name). Malformed calls are still forwarded
-    unchanged and logged; they just get no real policy decision.
+    (invalid id, malformed params or arguments, invalid tool name). Malformed
+    calls get no real policy decision: audit forwards them, enforce blocks them.
     """
+    if not valid_request_id(msg.get("id")):
+        return None, None, f"invalid request id {msg.get('id')!r}: MCP requires a string or integer"
     params = msg.get("params")
     if params is None:
         params = {}
@@ -133,10 +214,12 @@ def split_call(msg):
         return None, None, f"malformed params: expected an object, got {type(params).__name__}"
     tool = params.get("name")
     args = params.get("arguments")
-    if args is None:
+    if args is None:                     # omitted or null: "no arguments" (MCP allows omitting it)
         args = {}
     if not isinstance(tool, str) or not tool:
         return tool, args, f"invalid tool name {tool!r}"
+    if not isinstance(args, dict):
+        return tool, args, f"malformed arguments: expected an object, got {type(args).__name__}"
     return tool, args, None
 
 
@@ -153,17 +236,48 @@ class _Pending:
 
 
 class Proxy:
-    def __init__(self, log, tee, policy=None, mode="audit"):
+    def __init__(self, log, tee, policy=None, mode="audit", out=None):
         self.log = log
         self.tee = tee
         self.policy = policy
         self.mode = mode
+        self.out = out                   # our stdout (needed to answer blocked calls)
         # request id key -> FIFO list of _Pending. A list, not a single entry,
         # so two in-flight calls with the same id never overwrite each other.
         self.pending = {}
         self.seq = 0
         self.list_ids = set()            # ids of tools/list requests (for the name check)
         self.listed_tools = set()
+        self.policy_failure = None       # set once the policy machinery fails: state untrusted
+        self.fatal = None                # set when the audit log fails: session stops
+        self.up_task = None              # so a fatal error in the down pump can stop the up pump
+
+    # ---------------- failure handling ----------------
+    def mark_unhealthy(self, why):
+        if self.policy_failure is None:
+            self.policy_failure = why
+            warn(f"POLICY FAILED, state no longer trusted: {why}. "
+                 + ("Every later call will be BLOCKED." if self.mode == "enforce"
+                    else "Later calls logged as policy_error."))
+
+    def safe_states(self, fields):
+        """Policy state for logging. Never raises: a failure is recorded in the
+        log and marks the policy unhealthy."""
+        try:
+            return self.policy.states()
+        except Exception as e:                       # noqa: BLE001
+            fields["states_error"] = f"{type(e).__name__}: {e}"
+            self.mark_unhealthy(f"cannot read policy state ({fields['states_error']})")
+            return None
+
+    def log_write(self, **kw):
+        """Write one record. On failure: stop the session (fail closed)."""
+        try:
+            self.log.write(**kw)
+        except Exception as e:                       # noqa: BLE001
+            self.fatal = f"audit log write failed: {type(e).__name__}: {e}"
+            warn(f"{self.fatal}. Stopping the session: nothing more is forwarded.")
+            raise SessionAbort(self.fatal) from e
 
     def pending_count(self):
         return sum(len(q) for q in self.pending.values())
@@ -171,32 +285,67 @@ class Proxy:
     # ---------------- policy (audit) ----------------
     def check(self, tool, problem=None):
         """Ask the policy about one call. Returns (PolicyDecision or None, log fields).
+        Never raises: any failure becomes decision "policy_error".
 
-        decision values:
+        decision (what the policy said):
             allow         policy allows; committed after successful dispatch
-            would_deny    policy would block; forwarded anyway (audit), NOT committed
-            policy_error  no real decision was made (malformed call, or the policy
-                          failed); forwarded (audit), NOT committed, never reported as allow
+            would_deny    (audit) policy would block; forwarded anyway, NOT committed
+            deny          (enforce) policy blocks; NOT forwarded, NOT committed
+            policy_error  no real decision was made (malformed call, policy failure,
+                          or the policy is marked FAILED); NOT committed, never allow.
+                          audit: forwarded; enforce: blocked (fail closed)
+        action (what mcpfw does): "forward" or "block"
         """
-        states = self.policy.states()
-        fields = {"policy_fp": self.policy.fingerprint, "mode": self.mode,
-                  "rules_enabled": list(self.policy.enabled), "committed": False}
+        enforce = self.mode == "enforce"
+        fields = {"mode": self.mode, "committed": False}
+        states = None
         t0 = time.monotonic_ns()
         try:
+            fields.update(policy_fp=self.policy.fingerprint, rules_enabled=list(self.policy.enabled))
+            states = self.safe_states(fields)
+            if problem is None and self.policy_failure is not None:
+                problem = f"policy marked FAILED earlier in this session ({self.policy_failure})"
             if problem is not None:
                 raise ValueError(problem)
             pd = self.policy.decide(tool)
-        except Exception as e:                       # noqa: BLE001 (any policy failure)
-            fields.update(decision="policy_error", rules_fired=[], states_before=states,
-                          states_after=states, reason="", policy_error=f"{type(e).__name__}: {e}",
-                          decide_ns=time.monotonic_ns() - t0)
-            warn(f"no policy decision for tool {tool!r}: {e} (audit mode: forwarded, not committed)")
-            return None, fields
-        fields.update(decision="allow" if pd.allow else "would_deny",
-                      rules_fired=list(pd.rules_fired), states_before=pd.states_before(),
-                      states_after=pd.states_after(), reason=pd.reason,
-                      decide_ns=time.monotonic_ns() - t0)
+            if pd.allow:
+                decision, action = "allow", "forward"
+            else:
+                decision, action = ("deny", "block") if enforce else ("would_deny", "forward")
+            fields.update(decision=decision, action=action,
+                          rules_fired=list(pd.rules_fired), states_before=pd.states_before(),
+                          states_after=pd.states_after(), reason=pd.reason)
+        except Exception as e:                       # noqa: BLE001 (any failure -> policy_error)
+            error = f"{type(e).__name__}: {e}"
+            fields.update(decision="policy_error", action="block" if enforce else "forward",
+                          rules_fired=[], states_before=states, states_after=states,
+                          reason=NO_DECISION_REASON.format(error=error) if enforce else "",
+                          policy_error=error)
+            warn(f"no policy decision for tool {tool!r}: {error} "
+                 f"({'blocked' if enforce else 'audit mode: forwarded'}, not committed)")
+            pd = None
+        fields["decide_ns"] = time.monotonic_ns() - t0
+        fields["policy_health"] = "failed" if self.policy_failure else "ok"
         return pd, fields
+
+    def block(self, msg, tool, args, fields):
+        """Enforce: answer a blocked call ourselves. Log FIRST, then respond,
+        so no block ever happens without a record."""
+        fields["states_after"] = self.safe_states(fields)   # nothing committed
+        if valid_request_id(msg.get("id")):
+            result, line = block_response(msg["id"], fields["reason"])
+        else:                                                  # cannot echo an invalid id
+            result, line = invalid_request_response(fields["reason"])
+        t = time.monotonic_ns()
+        # Log FIRST. If this raises SessionAbort, no response is sent and the
+        # request was never forwarded: nothing happens without a record.
+        self.log_write(seq=self.seq, t_req=t, t_resp=t, tool=tool, args=args, is_error=True,
+                       result_text=fields["reason"], result=result, extra=fields)
+        self.seq += 1
+        self.out.write(line)                                   # one whole line, then flush:
+        self.out.flush()                                       # never interleaves with the down pump
+        self.tee.write("down_out", line)
+        self.tee.write("down_injected", line)
 
     def commit(self, pd, fields):
         """Called only after successful dispatch. Afterwards states_after is set
@@ -208,8 +357,11 @@ class Proxy:
                 fields["committed"] = True
             except Exception as e:                   # noqa: BLE001
                 fields["commit_error"] = f"{type(e).__name__}: {e}"
-                warn(f"policy commit failed for {pd.tool!r}: {e}")
-        fields["states_after"] = self.policy.states()
+                # The call was already sent (still logged as forwarded), but the
+                # rules did not record it: their state is now wrong. Stop trusting it.
+                self.mark_unhealthy(f"commit failed for `{pd.tool}` ({fields['commit_error']})")
+        fields["states_after"] = self.safe_states(fields)
+        fields["policy_health"] = "failed" if self.policy_failure else "ok"
 
     # ---------------- observation ----------------
     def register(self, msg, tool, args, extra=None):
@@ -249,7 +401,7 @@ class Proxy:
         if entry.duplicate:
             extra = {**(extra or {}), "duplicate_id": True}
         # `result` is required: events.py hashes it into res_h (guide §8.4).
-        self.log.write(seq=entry.seq, t_req=entry.t_req, t_resp=t_resp, tool=entry.tool,
+        self.log_write(seq=entry.seq, t_req=entry.t_req, t_resp=t_resp, tool=entry.tool,
                        args=entry.args, is_error=is_error, result_text=text, result=result,
                        extra=extra)
 
@@ -295,9 +447,9 @@ class Proxy:
     async def up_pump(self, stdin_reader, child):
         """Our stdin -> child's stdin."""
         try:
-            while True:
+            while self.fatal is None:
                 line = await read_line(stdin_reader)
-                if not line:                         # §8.5 step 1: our stdin hit EOF
+                if not line or self.fatal is not None:   # EOF, or session stopped meanwhile
                     break
                 self.tee.write("up_in", line)
                 msg = parse_copy(line)
@@ -305,7 +457,7 @@ class Proxy:
                 pd, fields, entry = None, None, None
                 if is_call:
                     tool, args, problem = split_call(msg)    # never raises on malformed input
-                    if problem is not None:
+                    if problem is not None and self.mode != "enforce":
                         warn(f"{problem}; forwarded unchanged")
                 if self.policy is not None:
                     if is_call:
@@ -314,6 +466,10 @@ class Proxy:
                         self.list_ids.add(id_key(msg["id"]))
                     elif msg is not None and msg.get("method") == "tools/call":
                         warn("tools/call without an id forwarded WITHOUT a policy decision")
+                if is_call and fields is not None and fields["action"] == "block":
+                    self.tee.write("up_blocked", line)   # NOT forwarded to the server
+                    self.block(msg, tool, args, fields)
+                    continue
                 if is_call:
                     entry = self.register(msg, tool, args, fields)  # BEFORE sending
                 try:
@@ -321,7 +477,7 @@ class Proxy:
                     await child.stdin.drain()        # raises if the bytes could not be sent
                 except BaseException:
                     if entry is not None:
-                        self.remove(entry)           # never dispatched: no commit, no record
+                        self.remove(entry)           # not confirmed dispatched: no commit, no record
                     raise
                 self.tee.write("up_out", line)
                 if is_call:
@@ -330,6 +486,8 @@ class Proxy:
                     self.mark_dispatched(entry)      # writes the record if the response came first
         except (BrokenPipeError, ConnectionResetError):
             warn("child stdin closed early")
+        except SessionAbort:
+            pass                                     # fatal: stop forwarding; finally closes the server
         finally:
             try:
                 child.stdin.close()                  # child sees EOF -> writes env_post.json
@@ -344,18 +502,33 @@ class Proxy:
             if not line:                             # §8.5 step 2: drained
                 break
             self.tee.write("down_in", line)
+            if self.fatal is not None:               # session stopped: drain, forward nothing
+                continue
             stdout.write(line)                       # exact bytes read
             stdout.flush()
             self.tee.write("down_out", line)
-            self.observe_down(line)                  # after forwarding
+            try:
+                self.observe_down(line)              # after forwarding
+            except SessionAbort:
+                if self.up_task is not None:
+                    self.up_task.cancel()            # stop reading the agent; server stdin closes
 
 
 async def run(args, policy):
     log = ChainWriter(args.log)
     tee = Tee(args.tee)
-    proxy = Proxy(log, tee, policy, args.mode)
+    proxy = Proxy(log, tee, policy, args.mode, out=sys.stdout.buffer)
 
     loop = asyncio.get_running_loop()
+    # SIGTERM (e.g. the MCP client's shutdown escalation): stop in order, so the
+    # finally block below still closes the log and the captures, instead of the
+    # process dying mid-write. Records already written stay valid either way.
+    main_task = asyncio.current_task()
+    child = None
+    try:
+        loop.add_signal_handler(signal.SIGTERM, main_task.cancel)
+    except (NotImplementedError, RuntimeError):     # not available on Windows
+        pass
     stdin_reader = asyncio.StreamReader(limit=LINE_LIMIT)
     await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(stdin_reader), sys.stdin)
 
@@ -365,6 +538,7 @@ async def run(args, policy):
 
     stdout = sys.stdout.buffer
     up = asyncio.create_task(proxy.up_pump(stdin_reader, child))
+    proxy.up_task = up
     try:
         await proxy.down_pump(child, stdout)         # returns when the child's stdout closes
         if not up.done():                            # child exited first: stop reading stdin
@@ -375,10 +549,21 @@ async def run(args, policy):
             pass
         code = await child.wait()                    # §8.5 step 3; never kill the child early
     finally:
+        if child is not None and child.returncode is None and main_task.cancelling():
+            try:
+                child.terminate()                    # we were told to stop: pass it on
+            except ProcessLookupError:
+                pass
         if proxy.pending_count():
             warn(f"{proxy.pending_count()} tools/call request(s) not logged (no response, or log write failed)")
-        log.close()                                  # §8.5 step 4
+        try:
+            log.close()                              # §8.5 step 4
+        except Exception as e:                       # noqa: BLE001 (log already failed)
+            warn(f"closing the log failed: {e}")
         tee.close()
+    if proxy.fatal is not None:
+        warn(f"session stopped: {proxy.fatal}")
+        return EXIT_LOG_FAILURE
     return code
 
 
@@ -394,8 +579,51 @@ def main(argv=None):
             warn(f"invalid policy, server NOT started: {e}")
             sys.exit(EXIT_BAD_POLICY)
         warn(f"policy {args.policy} ({policy.fingerprint[:12]}) rules={list(policy.enabled)} mode={args.mode}")
-    code = asyncio.run(run(args, policy))
+    try:
+        code = asyncio.run(run(args, policy))
+    except asyncio.CancelledError:                   # only our SIGTERM handler cancels run()
+        warn("stopped by SIGTERM; log and captures closed")
+        code = EXIT_TERMINATED
+    if args.stats:
+        write_stats(args.stats, code)
     sys.exit(code)                                   # §8.5 step 5: child's exit code
+
+
+def peak_rss_kb():
+    """Peak resident memory of THIS process, in KB, and where it came from.
+
+    Linux: VmHWM from /proc/self/status. It is reset when a program starts, so
+    it is mcpfw's own peak. getrusage().ru_maxrss is NOT used on Linux because
+    it also carries the parent's memory from the moment mcpfw was started (a
+    large harness made mcpfw look like 200 MB instead of ~23 MB).
+    """
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]), "VmHWM"
+    except OSError:
+        pass
+    import resource                                   # other systems: best available
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, "ru_maxrss"
+
+
+def write_stats(path, code):
+    """Written after the session has ended (log and captures closed), so its
+    existence also means the capture files are complete. Best effort: a
+    failure only warns and never changes the exit code, because measurement
+    must not affect the run.
+    """
+    try:
+        import os
+        kb, source = peak_rss_kb()
+        data = {"proxy_peak_rss_kb": kb, "rss_source": source, "exit_code": code}
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)                        # atomic: readers never see half a file
+    except Exception as e:                           # noqa: BLE001
+        warn(f"could not write --stats file: {e}")
 
 
 if __name__ == "__main__":

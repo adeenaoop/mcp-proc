@@ -28,9 +28,18 @@ async def read_line(reader):
 
 
 class Tee:
-    """Appends raw bytes to four capture files (§8.6). Disabled when dir is None."""
+    """Appends raw bytes to capture files (§8.6). Disabled when dir is None.
 
-    NAMES = ("up_in", "up_out", "down_in", "down_out")
+    up_in        every line read from the agent
+    up_out       lines forwarded to the server
+    up_blocked   lines NOT forwarded because enforce mode blocked them
+    down_in      every line read from the server
+    down_out     every line written to the agent
+    down_injected  block responses mcpfw itself wrote to the agent
+    Without blocking, up_blocked and down_injected stay empty.
+    """
+
+    NAMES = ("up_in", "up_out", "up_blocked", "down_in", "down_out", "down_injected")
 
     def __init__(self, directory):
         self._files = {}
@@ -48,3 +57,41 @@ class Tee:
     def close(self):
         for f in self._files.values():
             f.close()
+
+
+class WireMismatch(Exception):
+    pass
+
+
+def _lines(path):
+    return path.read_bytes().splitlines(keepends=True) if path.exists() else []
+
+
+def _merge_check(total, a, b, what):
+    """Every line of `total`, in order, must be the next line of `a` or of `b`,
+    and every line of `a` and `b` must be used exactly once."""
+    i = j = 0
+    for n, line in enumerate(total):
+        if i < len(a) and line == a[i]:
+            i += 1
+        elif j < len(b) and line == b[j]:
+            j += 1
+        else:
+            raise WireMismatch(f"{what}: line {n + 1} is not accounted for: {line[:80]!r}")
+    if i != len(a) or j != len(b):
+        raise WireMismatch(f"{what}: {len(a) - i + len(b) - j} captured line(s) never appeared")
+
+
+def verify_tee(directory):
+    """X2 under enforce: every byte accounted for, in order.
+
+        up_in    = up_out   interleaved with up_blocked
+        down_out = down_in  interleaved with down_injected
+    With no blocking this is exactly the strict X2 equality.
+    """
+    from pathlib import Path
+    d = Path(directory)
+    _merge_check(_lines(d / "up_in.bin"), _lines(d / "up_out.bin"), _lines(d / "up_blocked.bin"),
+                 "agent->server")
+    _merge_check(_lines(d / "down_out.bin"), _lines(d / "down_in.bin"), _lines(d / "down_injected.bin"),
+                 "server->agent")

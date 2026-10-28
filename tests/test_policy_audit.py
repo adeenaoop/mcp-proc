@@ -144,7 +144,8 @@ def test_bad_policy_never_starts_server(tmp_path, opts):
     assert b"server NOT started" in p.stderr
 
 
-@pytest.mark.parametrize("opts", [["--mode", "enforce", "--policy", str(POLICY)],   # not until step 4
+@pytest.mark.parametrize("opts", [["--mode", "enforce"],                            # --mode without --policy
+                                  ["--mode", "bogus", "--policy", str(POLICY)],     # unknown mode
                                   ["--rules", "R1"]])                               # --rules without --policy
 def test_bad_options_rejected(tmp_path, opts):
     p, marker = start_proxy_expecting_failure(tmp_path, opts)
@@ -538,5 +539,6 @@ def test_failed_log_write_keeps_entry_pending():
         def write(self, **kw):
             raise OSError("disk full")
     _, proxy, _, err = run_pumps(None, [call_line("read_file", 1)], [response_line(1, "a")], log=FailingLog())
-    assert isinstance(err, OSError)
+    # step 4 failure rule: a log failure stops the session cleanly (no crash)
+    assert err is None and proxy.fatal is not None and "disk full" in proxy.fatal
     assert proxy.pending_count() == 1, "entry dropped before its record was written"

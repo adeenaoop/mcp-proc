@@ -39,10 +39,12 @@ from events import verify_chain  # noqa: E402
 from fake_llm import GroundTruthFakeClient  # noqa: E402
 from mcp_runtime import MCPRuntime  # noqa: E402
 from run_direct import build_pipeline, make_client, numeric_task_ids  # noqa: E402
+from wire import WireMismatch, verify_tee  # noqa: E402
 
 SERVER = ROOT / "server" / "agentdojo_mcp_server.py"
 PROXY = ROOT / "mcpfw" / "proxy.py"
 ENV_POST_TIMEOUT_S = 10
+STATS_TIMEOUT_S = 10
 MAX_ATTEMPTS = 3
 
 
@@ -78,7 +80,7 @@ def to_json(obj):
     return json.dumps(obj, indent=2, default=lambda o: o.model_dump() if hasattr(o, "model_dump") else str(o))
 
 
-def server_command(ep_dir, suite_name, bench, user_task_id, via_proxy):
+def server_command(ep_dir, suite_name, bench, user_task_id, via_proxy, proxy_extra=()):
     server_args = [str(SERVER), "--suite", suite_name, "--bench-version", bench,
                    "--user-task", user_task_id,
                    "--injections", str(ep_dir / "injections.json"),
@@ -86,12 +88,45 @@ def server_command(ep_dir, suite_name, bench, user_task_id, via_proxy):
                    "--env-out", str(ep_dir / "env_post.json")]
     if not via_proxy:
         return sys.executable, server_args
-    return sys.executable, [str(PROXY), "--log", str(ep_dir / "trace.jsonl"),
+    return sys.executable, [str(PROXY), "--log", str(ep_dir / "trace.jsonl"), *proxy_extra,
                             "--", sys.executable, *server_args]
 
 
+def measure_results(ep_dir):
+    """Memory and wire fidelity for one episode. Never raises: a failed check
+    is recorded as a result (wire_ok=False), not turned into a crashed episode."""
+    out = {}
+    stats_path = ep_dir / "proxy_stats.json"
+    deadline = time.monotonic() + STATS_TIMEOUT_S
+    while not stats_path.exists() and time.monotonic() < deadline:   # written last, at proxy exit
+        time.sleep(0.05)
+    if stats_path.exists():
+        stats = json.loads(stats_path.read_text())
+        out["proxy_peak_rss_kb"] = stats.get("proxy_peak_rss_kb")
+        out["rss_source"] = stats.get("rss_source")
+        out["proxy_exit_code"] = stats.get("exit_code")
+    else:
+        out["proxy_peak_rss_kb"] = out["rss_source"] = out["proxy_exit_code"] = None
+    if not stats_path.exists():
+        out["wire_ok"], out["wire_error"] = False, "proxy did not finish (no stats file), captures may be incomplete"
+        return out
+    if not (ep_dir / "wire" / "up_in.bin").exists():                # nothing captured = nothing proven
+        out["wire_ok"], out["wire_error"] = False, "no capture files"
+        return out
+    try:
+        verify_tee(ep_dir / "wire")
+        out["wire_ok"], out["wire_error"] = True, None
+    except WireMismatch as e:
+        out["wire_ok"], out["wire_error"] = False, str(e)
+    return out
+
+
 def run_episode(suite, suite_name, bench, user_task_id, rep, client, model, out_root,
-                injection_task_id=None, injections=None, via_proxy=True, force=False):
+                injection_task_id=None, injections=None, via_proxy=True, force=False,
+                proxy_extra=(), measure=False):
+    """proxy_extra: extra mcpfw options, e.g. ["--policy", "policies/banking.json", "--mode", "enforce"].
+    measure: (with via_proxy) also capture raw bytes (--tee) and peak memory (--stats), then
+    verify the captures (wire fidelity) and add both to the result."""
     user_task = suite.user_tasks[user_task_id]
     injection_task = suite.injection_tasks[injection_task_id] if injection_task_id else None
     injections = injections or {}
@@ -108,12 +143,15 @@ def run_episode(suite, suite_name, bench, user_task_id, rep, client, model, out_
     # 2. injections.json
     (ep_dir / "injections.json").write_text(json.dumps(injections))
 
+    if measure and via_proxy:
+        proxy_extra = [*proxy_extra, "--tee", str(ep_dir / "wire"), "--stats", str(ep_dir / "proxy_stats.json")]
+
     pipeline = build_pipeline(client, model)
     client.reset()
     t0 = time.monotonic()
 
     # 3. start the bridge (-> mcpfw -> server)
-    command, args = server_command(ep_dir, suite_name, bench, user_task_id, via_proxy)
+    command, args = server_command(ep_dir, suite_name, bench, user_task_id, via_proxy, proxy_extra)
     bridge = MCPBridge(command, args, expected_tools={f.name for f in suite.tools})
     try:
         # 4. runtime with the SAME suite.tools as direct mode
@@ -169,9 +207,27 @@ def run_episode(suite, suite_name, bench, user_task_id, rep, client, model, out_
     }
     # X3 on a real episode: one trace record per tool-result message.
     if via_proxy:
-        trace_records = len(verify_chain(ep_dir / "trace.jsonl"))   # raises if the chain is broken
-        record["trace_records"] = trace_records
-        record["trace_matches_tool_calls"] = trace_records == n_tool_calls
+        records = verify_chain(ep_dir / "trace.jsonl")              # raises if the chain is broken
+        record["trace_records"] = len(records)
+        record["trace_matches_tool_calls"] = len(records) == n_tool_calls
+        blocked = [r for r in records if r.get("action") == "block"]
+        record["n_blocked"] = len(blocked)
+        record["blocked_tools"] = [r["tool"] for r in blocked]
+        record["rules_fired"] = sorted({x for r in blocked for x in r.get("rules_fired", [])})
+        record["policy_errors"] = sum(r.get("decision") == "policy_error" for r in records)
+        record["decide_ns"] = [r["decide_ns"] for r in records if "decide_ns" in r]
+        record["call_latency_ns"] = [r["t_resp"] - r["t_req"] for r in records if r.get("action") != "block"]
+        record["chain_ok"] = True                                   # verify_chain above would have raised
+        decisions = {}
+        for r in records:
+            k = r.get("decision", "none")                          # "none" = no policy loaded (config B)
+            decisions[k] = decisions.get(k, 0) + 1
+        record["decisions"] = decisions
+        record["n_would_deny"] = decisions.get("would_deny", 0)
+        record["rules_would_fire"] = sorted({x for r in records if r.get("decision") == "would_deny"
+                                             for x in r.get("rules_fired", [])})
+        if measure:
+            record.update(measure_results(ep_dir))
 
     # 10. result JSON (§3.4 format + extras), plus the full conversation
     (ep_dir / "messages.json").write_text(to_json(messages))

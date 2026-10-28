@@ -100,7 +100,10 @@ class Decision:
     """Diagnostic only. For a SINK/SOURCE_SINK call after a taint: True if it
     goes to a server no untrusted read came from, False if same server, None
     if unknown or not applicable."""
-    version: int = 0          # rule's commit count when decided (staleness check)
+    destination: str | None = None
+    """R2 only: the normalised destination this call sends to (None if the
+    call has no destination or it was missing/malformed). R1 never sets it."""
+    version: int = 0         # rule's commit count when decided (staleness check)
     _issuer: object = field(default=None, repr=False, compare=False)
 
 
@@ -205,6 +208,144 @@ class TaintThenDeny:
         """State for logging."""
         return {"state": self.state, "version": self.version,
                 "taints": [{"tool": t.tool, "server": t.server} for t in self.taints]}
+
+
+# =====================================================================
+# R2: at most K distinct destinations per session
+# =====================================================================
+def count_state(n):
+    """State name for an R2 automaton that has used n distinct destinations."""
+    return f"COUNT_{n}"
+
+
+def normalise_destination(value):
+    """'Alice', ' alice ' and 'ALICE' are the same destination."""
+    return value.strip().casefold()
+
+
+@dataclass
+class DistinctDestinationLimit:
+    """R2: a session may send to at most K distinct destinations.
+
+    A destination is the value of one argument of an egress tool, e.g.
+    send_money.recipient, send_channel_message.channel, post_webpage.url.
+
+    States COUNT_0 .. COUNT_K (finite, because K is fixed). For a call:
+        tool not in dest_args            -> allow (OTHER), state unchanged
+        destination already used         -> allow, state unchanged
+        new destination, count <  K      -> allow, COUNT_n -> COUNT_n+1
+        new destination, count == K      -> DENY,  state unchanged
+        destination argument missing     -> allow, not counted, if the tool is
+                                            in `optional` (it may omit it, e.g.
+                                            update_scheduled_transaction);
+                                            otherwise DENY
+        destination malformed (not a     -> DENY (fail closed)
+        string, or blank), or args not a dict
+    Example, K=2: A, A, B, C -> allow, allow, allow, DENY.
+
+    Same decide/commit lifecycle and staleness check as R1: only forwarded
+    (committed) calls use a slot.
+
+    Limits, to state in the report:
+    * Destinations are compared as normalised strings only. "www.x.com" and
+      "https://www.x.com/" count as two destinations; two different strings
+      that mean the same account are not merged.
+    * R2 is not taint-gated: it counts destinations from the start of the
+      session, whether or not untrusted content was read.
+    """
+
+    rule_id: str
+    dest_args: dict           # tool name -> name of the argument holding the destination
+    k: int
+    optional: frozenset = frozenset()   # tools that may omit the destination argument
+    destinations: list = field(default_factory=list, init=False)   # committed, normalised, in order
+    version: int = field(default=0, init=False)
+
+    def __post_init__(self):
+        if not isinstance(self.rule_id, str) or not self.rule_id:
+            raise ValueError("rule_id must be a non-empty string")
+        if not isinstance(self.dest_args, dict) or not self.dest_args:
+            raise ValueError(f"{self.rule_id}: dest_args must be a non-empty dict tool -> argument name")
+        bad = [(t, a) for t, a in self.dest_args.items()
+               if not isinstance(t, str) or not t or not isinstance(a, str) or not a]
+        if bad:
+            raise TypeError(f"{self.rule_id}: dest_args has invalid entries: {bad!r}")
+        self.dest_args = dict(self.dest_args)
+        if isinstance(self.k, bool) or not isinstance(self.k, int) or self.k < 1:
+            raise ValueError(f"{self.rule_id}: k must be an integer >= 1, got {self.k!r}")
+        if isinstance(self.optional, str):
+            raise TypeError("optional must be a collection of tool names, not a single string")
+        self.optional = frozenset(self.optional)
+        extra = self.optional - set(self.dest_args)
+        if extra:
+            raise ValueError(f"{self.rule_id}: optional names tools not in dest_args: {sorted(extra)}")
+
+    @property
+    def state(self):
+        return count_state(len(self.destinations))
+
+    def classify(self, tool):
+        return SINK if tool in self.dest_args else OTHER
+
+    def decide(self, tool, args, server=None):
+        """What would happen to this call. Does NOT change state."""
+        cls = self.classify(tool)
+        before = self.state
+
+        def result(allow, dest=None, after=before, reason=""):
+            return Decision(allow=allow, rule=self.rule_id, tool=tool, server=server, tool_class=cls,
+                            state_before=before, state_after=after, reason=reason,
+                            destination=dest, version=self.version, _issuer=self)
+
+        if cls == OTHER:
+            return result(True)
+        if not isinstance(args, dict):
+            return result(False, reason=self._malformed(tool, "the call has no valid arguments"))
+        arg = self.dest_args[tool]
+        if arg not in args:
+            if tool in self.optional:
+                return result(True)
+            return result(False, reason=self._malformed(tool, f"argument `{arg}` is missing"))
+        raw = args[arg]
+        if not isinstance(raw, str) or not raw.strip():
+            return result(False, reason=self._malformed(tool, f"argument `{arg}` is not a usable destination"))
+
+        dest = normalise_destination(raw)
+        if dest in self.destinations:
+            return result(True, dest)
+        if len(self.destinations) < self.k:
+            return result(True, dest, after=count_state(len(self.destinations) + 1))
+        return result(False, dest, reason=self._limit_reason(tool, dest))
+
+    def commit(self, decision):
+        """Apply the transition authorised by `decision` (after forwarding)."""
+        if not isinstance(decision, Decision):
+            raise TypeError("commit() takes the Decision returned by decide()")
+        if decision._issuer is not self:
+            raise ValueError(f"{self.rule_id}: decision was issued by a different rule")
+        if not decision.allow:
+            raise ValueError(f"{self.rule_id}: cannot commit denied call `{decision.tool}`")
+        if decision.version != self.version or decision.state_before != self.state:
+            raise StaleDecisionError(
+                f"{self.rule_id}: decision for `{decision.tool}` is stale "
+                f"(decided at version {decision.version}, rule is now at version {self.version})")
+        if decision.destination is not None and decision.destination not in self.destinations:
+            self.destinations.append(decision.destination)
+        self.version += 1
+
+    def _limit_reason(self, tool, dest):
+        used = ", ".join(f"`{d}`" for d in self.destinations)
+        return (f"Blocked by mcpfw ({self.rule_id}): `{tool}` would send to a new destination "
+                f"`{dest}`, but this session has already used the maximum of {self.k} "
+                f"distinct destination(s) ({used}).")
+
+    def _malformed(self, tool, what):
+        return f"Blocked by mcpfw ({self.rule_id}): `{tool}` cannot be checked: {what}."
+
+    def snapshot(self):
+        """State for logging."""
+        return {"state": self.state, "version": self.version, "k": self.k,
+                "destinations": list(self.destinations)}
 
 
 # =====================================================================

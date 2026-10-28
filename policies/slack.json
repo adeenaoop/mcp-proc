@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "suite": "slack",
+  "classes": {
+    "untrusted_source": ["get_webpage", "get_channels"],
+    "egress": ["send_direct_message", "send_channel_message", "post_webpage", "get_webpage"]
+  },
+  "rules": {
+    "R1": {"type": "taint_then_deny", "source": "untrusted_source", "sink": "egress"}
+  },
+  "notes": "untrusted_source: measured by canary probe (tools whose output carried injected text, AgentDojo v1.2.2). egress: policy choice (tools that send data out; get_webpage is both, since a requested URL can carry data). Tool-level only: R1 does not inspect arguments."
+}
